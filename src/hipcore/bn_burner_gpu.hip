@@ -66,7 +66,36 @@ extern "C" __global__ void hyperion_burner_dev_kernel(
 
     int tid = threadIdx.x;
 
-   
+    // ------------------------------------------------------------
+    // Shared memory (block-scoped, staged once per block)
+    //
+    // Dynamic LDS layout:
+    //   flux       [NUM_REACTIONS]    doubles  - per-reaction flux scratch
+    //   reduce_buf [num_waves]        doubles  - cross-wave reduction scratch
+    //   fp_fac_lds [NUM_FLUXES_PLUS]  uchar    - packed f_plus_factor  (exp19)
+    //   fm_fac_lds [NUM_FLUXES_MINUS] uchar    - packed f_minus_factor (exp19)
+    //
+    // The stoichiometric factor arrays f_plus_factor / f_minus_factor hold
+    // small integer weights (values in 0..3) that the j-loops in the
+    // species-update stage re-read every outer-while iteration for every
+    // zone. Packing them as uchar in LDS eliminates the dominant global
+    // memory traffic in that hot loop. uchar -> double conversion is exact
+    // for this data, so xout[] / sdotrate[] remain bit-identical to the
+    // baseline.
+    // ------------------------------------------------------------
+    extern __shared__ double smem[];
+    const int       num_waves_k = blockDim.x >> 6;
+    double*         flux       = smem;                                      // NUM_REACTIONS
+    double*         reduce_buf = flux + NUM_REACTIONS;                      // num_waves
+    unsigned char*  fp_fac_lds = (unsigned char*)(reduce_buf + num_waves_k); // NUM_FLUXES_PLUS bytes
+    unsigned char*  fm_fac_lds = fp_fac_lds + NUM_FLUXES_PLUS;               // NUM_FLUXES_MINUS bytes
+
+    for (int j = tid; j < NUM_FLUXES_PLUS; j += blockDim.x)
+        fp_fac_lds[j] = (unsigned char)f_plus_factor[j];
+    for (int j = tid; j < NUM_FLUXES_MINUS; j += blockDim.x)
+        fm_fac_lds[j] = (unsigned char)f_minus_factor[j];
+    __syncthreads();
+
     for (int zone = blockIdx.x; zone < Nzones; zone += gridDim.x){ 
 
         double* rate = rate_g + zone * NUM_REACTIONS;
@@ -80,14 +109,6 @@ extern "C" __global__ void hyperion_burner_dev_kernel(
         // Per-zone offsets
         double* xout_zone = xout + zone * SIZE;
         double* xin_zone  = xin  + zone * SIZE;
-    
-        // ------------------------------------------------------------
-        // Shared memory
-        // ------------------------------------------------------------
-        extern __shared__ double smem[];
-    
-        double* flux       = smem;                        // NUM_REACTIONS
-        double* reduce_buf = flux + NUM_REACTIONS;	      // blockDim.x
     
         __shared__ double norm_sum;
         double t, dt, t_end;
@@ -196,9 +217,9 @@ extern "C" __global__ void hyperion_burner_dev_kernel(
     	        double minus = 0.0;
     
                 for (int j = p0; j <= f_plus_max[i]; ++j)             //this could be source of divergence
-    	            plus += f_plus_factor[j] * flux[f_plus_map[j]];
-    	        for (int j = m0; j <= f_minus_max[i]; ++j)		  // ''
-    		    minus += f_minus_factor[j] * flux[f_minus_map[j]];
+                    plus += (double)fp_fac_lds[j] * flux[f_plus_map[j]];   // exp19: LDS uchar
+                for (int j = m0; j <= f_minus_max[i]; ++j)                // ''
+                    minus += (double)fm_fac_lds[j] * flux[f_minus_map[j]]; // exp19: LDS uchar
     
     
                 if (minus * dt > xout_zone[i]) {
